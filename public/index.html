@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>塔罗牌生成器</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>塔罗牌生成器</h1>
+      <p>基于 theme 文件夹隔离管理提示词、卡牌框示例图和生成结果。</p>
+    </div>
+    <button id="refreshBtn">刷新</button>
+  </header>
+
+  <main class="layout">
+    <aside class="panel">
+      <h2>主题管理</h2>
+      <div class="row">
+        <input id="newThemeName" placeholder="新主题名称">
+        <button id="createThemeBtn">新建主题</button>
+      </div>
+      <select id="themeSelect" size="8"></select>
+
+      <h2>卡牌框示例图</h2>
+      <div id="framePreview" class="frame-preview empty">未提供卡牌框示例图</div>
+      <textarea id="framePrompt" placeholder="没有卡牌框时，在这里输入卡牌框提示词，AI 会先画一个统一卡牌框。"></textarea>
+      <div class="row">
+        <select id="frameSize">
+          <option value="512x1024">1k 512x1024</option>
+          <option value="1024x2048">2k 1024x2048</option>
+        </select>
+        <button id="generateFrameBtn">生成卡牌框</button>
+      </div>
+
+      <h2>默认卡牌清单</h2>
+      <div id="defaultCardsSummary" class="summary"></div>
+    </aside>
+
+    <section class="panel main-panel">
+      <div id="themeEditor" class="theme-editor hidden">
+        <div class="editor-header">
+          <h2 id="themeTitle">主题</h2>
+          <button id="saveThemeBtn">保存主题 JSON</button>
+        </div>
+
+        <div class="grid two">
+          <label>主题名<input id="themeName"></label>
+          <label>分辨率
+            <select id="themeResolution">
+              <option value="512x1024">1k 512x1024</option>
+              <option value="1024x2048">2k 1024x2048</option>
+            </select>
+          </label>
+        </div>
+
+        <label>卡牌框图生图引导词<textarea id="frameGuide"></textarea></label>
+        <label>整套塔罗主题词<textarea id="themePrompt"></textarea></label>
+        <label>塔罗内部形象统一风格词（可留空）<textarea id="innerStyle"></textarea></label>
+        <label>分辨率控制提示词<textarea id="resolutionPrompt"></textarea></label>
+        <label>负面约束<textarea id="negativePrompt"></textarea></label>
+
+        <h2>卡牌预览与生成</h2>
+        <div class="filters">
+          <input id="cardSearch" placeholder="搜索卡牌，例如 愚人 / 权杖 / 逆位">
+          <select id="orientationFilter">
+            <option value="all">全部</option>
+            <option value="upright">正位</option>
+            <option value="reversed">逆位</option>
+          </select>
+        </div>
+        <div id="cardsGrid" class="cards-grid"></div>
+      </div>
+      <div id="emptyState" class="empty-state">请选择或新建一个主题。</div>
+    </section>
+  </main>
+
+  <dialog id="promptDialog">
+    <form method="dialog">
+      <h3 id="dialogTitle">提示词结构</h3>
+      <pre id="dialogContent"></pre>
+      <button>关闭</button>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

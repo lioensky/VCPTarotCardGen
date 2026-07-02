@@ -1,0 +1,522 @@
+#!/usr/bin/env node
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const ROOT = path.dirname(__filename);
+const PORT = Number(process.env.PORT || 3107);
+const THEMES_DIR = path.join(ROOT, 'tarotcardsthemes');
+const DEFAULT_CARDS_DIR = path.join(THEMES_DIR, 'defaulttarotcards');
+const TEMPLATE_THEME = path.join(ROOT, 'templates', 'default-theme.json');
+const PUBLIC_DIR = path.join(ROOT, 'public');
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+
+function log(scope, message, meta = {}) {
+  const time = new Date().toISOString();
+  const metaText = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
+  console.log(`[${time}] [${scope}] ${message}${metaText}`);
+}
+
+function maskSecret(value) {
+  if (!value) return '';
+  const text = String(value);
+  if (text.length <= 8) return '***';
+  return `${text.slice(0, 4)}***${text.slice(-4)}`;
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function writeJson(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadEnvFile() {
+  const envPath = path.join(ROOT, 'config.env');
+  const env = {};
+  if (!fs.existsSync(envPath)) return env;
+  for (const raw of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  return env;
+}
+
+function send(res, status, data, headers = {}) {
+  const body = Buffer.isBuffer(data) ? data : JSON.stringify(data);
+  res.writeHead(status, {
+    'Content-Type': Buffer.isBuffer(data) ? 'application/octet-stream' : 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    ...headers
+  });
+  res.end(body);
+}
+
+function sendText(res, status, text, type = 'text/plain; charset=utf-8') {
+  res.writeHead(status, { 'Content-Type': type });
+  res.end(text);
+}
+
+function safeId(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
+function assertSafeThemeId(themeId) {
+  const id = safeId(themeId);
+  if (!id || id !== themeId) throw new Error('非法 themeId');
+  return id;
+}
+
+function themePath(themeId) {
+  return path.join(THEMES_DIR, assertSafeThemeId(themeId));
+}
+
+function cardFileStem(cardId, orientation = 'upright') {
+  return orientation === 'reversed' ? `逆位${cardId}` : cardId;
+}
+
+function mimeOf(file) {
+  const ext = path.extname(file).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.css') return 'text/css; charset=utf-8';
+  if (ext === '.js') return 'text/javascript; charset=utf-8';
+  if (ext === '.html') return 'text/html; charset=utf-8';
+  return 'application/octet-stream';
+}
+
+function getCanonicalCards() {
+  const majors = ['0-愚人', '1-魔术师', '2-女祭祀', '3-皇后', '4-皇帝', '5-教皇', '6-恋人', '7-战车', '8-力量', '9-隐士', '10-命运之轮', '11-正义', '12-吊人', '13-死神', '14-节制', '15-恶魔', '16-高塔', '17-星星', '18-月亮', '19-太阳', '20-审判', '21-世界'];
+  const suits = ['权杖', '圣杯', '宝剑', '星币'];
+  const ranks = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '侍从', '骑士', '皇后', '国王'];
+  const cards = majors.map((name) => ({ id: name, name, arcana: 'major' }));
+  for (const suit of suits) {
+    for (const rank of ranks) cards.push({ id: `${suit}${rank}`, name: `${suit}${rank}`, arcana: 'minor', suit, rank });
+  }
+  cards.push({ id: '牌背', name: '牌背', arcana: 'back' });
+  return cards;
+}
+
+function listDefaultCards() {
+  if (!fs.existsSync(DEFAULT_CARDS_DIR)) return [];
+  return fs.readdirSync(DEFAULT_CARDS_DIR)
+    .filter((file) => IMAGE_EXTS.has(path.extname(file).toLowerCase()))
+    .filter((file) => !/^Thumbs\.db$/i.test(file))
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+
+function normalizeTheme(theme, fallbackId) {
+  const cards = getCanonicalCards();
+  theme.schemaVersion ||= 1;
+  theme.id ||= fallbackId;
+  theme.name ||= fallbackId;
+  theme.resolution ||= { label: '1k', size: '512x1024', prompt: '竖版塔罗牌构图，输出比例 1:2，建议分辨率 512x1024。' };
+  theme.prompts ||= {};
+  theme.prompts.frameImageGuide ||= '';
+  theme.prompts.theme ||= '';
+  theme.prompts.innerStyle ||= '';
+  theme.prompts.negative ||= '';
+  theme.assets ||= { frameExample: 'frame-example.png' };
+  theme.cards ||= {};
+  for (const card of cards) {
+    theme.cards[card.id] ||= { upright: '', reversed: card.id === '牌背' ? '' : '' };
+    theme.cards[card.id].upright ||= '';
+    theme.cards[card.id].reversed ||= '';
+  }
+  return theme;
+}
+
+function loadTheme(themeId) {
+  const dir = themePath(themeId);
+  const file = path.join(dir, 'theme.json');
+  if (!fs.existsSync(file)) throw new Error(`主题不存在: ${themeId}`);
+  return normalizeTheme(readJson(file), themeId);
+}
+
+function saveTheme(themeId, theme) {
+  const dir = themePath(themeId);
+  ensureDir(dir);
+  theme.id = themeId;
+  writeJson(path.join(dir, 'theme.json'), normalizeTheme(theme, themeId));
+}
+
+function createTheme(name, sourceThemeId = '') {
+  const id = safeId(name);
+  if (!id) throw new Error('主题名称不能为空');
+  const dir = themePath(id);
+  if (fs.existsSync(dir)) throw new Error(`主题已存在: ${id}`);
+  log('theme', '创建主题', { id, name, sourceThemeId: sourceThemeId || 'template' });
+  ensureDir(dir);
+  ensureDir(path.join(dir, 'cards'));
+  ensureDir(path.join(dir, 'backup'));
+  const sourceFile = sourceThemeId ? path.join(themePath(sourceThemeId), 'theme.json') : TEMPLATE_THEME;
+  const theme = normalizeTheme(readJson(sourceFile), id);
+  theme.id = id;
+  theme.name = name;
+  writeJson(path.join(dir, 'theme.json'), theme);
+  const sourceFrame = sourceThemeId ? path.join(themePath(sourceThemeId), theme.assets.frameExample || 'frame-example.png') : '';
+  if (sourceFrame && fs.existsSync(sourceFrame)) fs.copyFileSync(sourceFrame, path.join(dir, theme.assets.frameExample || 'frame-example.png'));
+  return getThemeState(id);
+}
+
+function findCardImage(themeId, cardId, orientation = 'upright') {
+  const cardsDir = path.join(themePath(themeId), 'cards');
+  const stem = cardFileStem(cardId, orientation);
+  for (const ext of ['.png', '.jpg', '.jpeg', '.webp']) {
+    const file = path.join(cardsDir, `${stem}${ext}`);
+    if (fs.existsSync(file)) return file;
+  }
+  return '';
+}
+
+function listBackups(themeId, cardId, orientation = 'upright') {
+  const backupDir = path.join(themePath(themeId), 'backup');
+  if (!fs.existsSync(backupDir)) return [];
+  const stem = cardFileStem(cardId, orientation);
+  return fs.readdirSync(backupDir)
+    .filter((file) => file.startsWith(`${stem}.`) || file.startsWith(`${stem}-`))
+    .filter((file) => IMAGE_EXTS.has(path.extname(file).toLowerCase()))
+    .sort()
+    .reverse()
+    .map((file) => ({ file, url: `/api/themes/${encodeURIComponent(themeId)}/backup/${encodeURIComponent(file)}` }));
+}
+
+function getThemeState(themeId) {
+  const theme = loadTheme(themeId);
+  const dir = themePath(themeId);
+  const frame = path.join(dir, theme.assets.frameExample || 'frame-example.png');
+  const cards = getCanonicalCards().map((card) => {
+    const upright = findCardImage(themeId, card.id, 'upright');
+    const reversed = card.id === '牌背' ? '' : findCardImage(themeId, card.id, 'reversed');
+    return {
+      ...card,
+      prompts: theme.cards[card.id] || { upright: '', reversed: '' },
+      images: {
+        upright: upright ? `/api/themes/${encodeURIComponent(themeId)}/cards/${encodeURIComponent(path.basename(upright))}` : '',
+        reversed: reversed ? `/api/themes/${encodeURIComponent(themeId)}/cards/${encodeURIComponent(path.basename(reversed))}` : ''
+      },
+      backups: {
+        upright: listBackups(themeId, card.id, 'upright'),
+        reversed: card.id === '牌背' ? [] : listBackups(themeId, card.id, 'reversed')
+      }
+    };
+  });
+  return {
+    theme,
+    frameExampleExists: fs.existsSync(frame),
+    frameExampleUrl: fs.existsSync(frame) ? `/api/themes/${encodeURIComponent(themeId)}/frame` : '',
+    cards
+  };
+}
+
+function listThemes() {
+  ensureDir(THEMES_DIR);
+  return fs.readdirSync(THEMES_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(THEMES_DIR, entry.name, 'theme.json')))
+    .map((entry) => {
+      const theme = loadTheme(entry.name);
+      return { id: theme.id, name: theme.name, description: theme.description || '' };
+    });
+}
+
+function assemblePrompt(theme, cardId, orientation = 'upright', includeResolution = true) {
+  const chunks = [
+    theme.prompts.frameImageGuide,
+    theme.prompts.theme,
+    theme.prompts.innerStyle,
+    includeResolution ? theme.resolution?.prompt : '',
+    theme.cards?.[cardId]?.[orientation],
+    theme.prompts.negative ? `负面约束：${theme.prompts.negative}` : ''
+  ];
+  return chunks.filter(Boolean).join('\n\n');
+}
+
+function timestamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function backupExisting(themeId, cardId, orientation) {
+  const existing = findCardImage(themeId, cardId, orientation);
+  if (!existing) return '';
+  const backupDir = path.join(themePath(themeId), 'backup');
+  ensureDir(backupDir);
+  const stem = cardFileStem(cardId, orientation);
+  const dest = path.join(backupDir, `${stem}-${timestamp()}${path.extname(existing)}`);
+  fs.renameSync(existing, dest);
+  log('backup', '已备份旧卡牌', {
+    themeId,
+    cardId,
+    orientation,
+    from: path.relative(ROOT, existing),
+    to: path.relative(ROOT, dest)
+  });
+  return dest;
+}
+
+function runGPTImageGen(args, context = {}) {
+  return new Promise((resolve, reject) => {
+    const envFile = loadEnvFile();
+    const env = { ...process.env, ...envFile, PROJECT_BASE_PATH: ROOT };
+    const startedAt = Date.now();
+    const safeArgs = {
+      command: args.command,
+      size: args.size,
+      quality: args.quality,
+      response_format: args.response_format,
+      image: args.image ? path.relative(ROOT, args.image) : '',
+      promptLength: args.prompt?.length || 0,
+      promptPreview: args.prompt ? `${args.prompt.slice(0, 160)}${args.prompt.length > 160 ? '...' : ''}` : ''
+    };
+
+    log('gptimage', '开始调用 GPTImageGen', {
+      ...context,
+      model: env.GPT_IMAGE_MODEL || 'gpt-image-2',
+      baseUrl: env.OPENAI_BASE_URL || '',
+      apiKey: maskSecret(env.OPENAI_API_KEY),
+      args: safeArgs
+    });
+
+    const child = spawn(process.execPath, [path.join(ROOT, 'GPTImageGen.js')], { cwd: ROOT, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      text.split(/\r?\n/).filter(Boolean).forEach((line) => log('gptimage:stderr', line));
+    });
+    child.on('error', (error) => {
+      log('gptimage', '子进程启动失败', { ...context, error: error.message });
+      reject(error);
+    });
+    child.on('close', (code) => {
+      const durationMs = Date.now() - startedAt;
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        if (parsed.status !== 'success') {
+          const errorMessage = parsed.error || stderr || 'GPTImageGen 调用失败';
+          log('gptimage', '调用失败', { ...context, code, durationMs, error: errorMessage });
+          reject(new Error(errorMessage));
+        } else {
+          const details = parsed.result?.details || {};
+          log('gptimage', '调用成功', {
+            ...context,
+            code,
+            durationMs,
+            serverPath: details.serverPath,
+            fileName: details.fileName,
+            imageCount: details.image_count
+          });
+          resolve(parsed);
+        }
+      } catch (error) {
+        log('gptimage', '输出解析失败', {
+          ...context,
+          code,
+          durationMs,
+          error: error.message,
+          stdoutPreview: stdout.slice(0, 300),
+          stderrPreview: stderr.slice(0, 300)
+        });
+        reject(new Error(`GPTImageGen 输出解析失败: ${error.message}\n${stdout}\n${stderr}`));
+      }
+    });
+    child.stdin.end(JSON.stringify(args));
+  });
+}
+
+function copyGeneratedToTheme(result, themeId, targetName) {
+  const details = result.result?.details || {};
+  const serverPath = Array.isArray(details.serverPath) ? details.serverPath[0] : details.serverPath;
+  if (!serverPath) throw new Error('生成结果缺少 serverPath');
+  const source = path.join(ROOT, serverPath);
+  if (!fs.existsSync(source)) throw new Error(`生成图片不存在: ${serverPath}`);
+  const ext = path.extname(source) || '.png';
+  const cardsDir = path.join(themePath(themeId), 'cards');
+  ensureDir(cardsDir);
+  const dest = path.join(cardsDir, `${targetName}${ext}`);
+  fs.copyFileSync(source, dest);
+  log('file', '生成图已复制到主题目录', {
+    themeId,
+    source: path.relative(ROOT, source),
+    dest: path.relative(ROOT, dest)
+  });
+  return dest;
+}
+
+async function generateCard(themeId, cardId, orientation = 'upright', forceResolution = false) {
+  const theme = loadTheme(themeId);
+  const frame = path.join(themePath(themeId), theme.assets.frameExample || 'frame-example.png');
+  if (!fs.existsSync(frame)) throw new Error('缺少卡牌框示例图，请先上传或生成 frame-example.png');
+
+  log('generate-card', '收到卡牌生成请求', {
+    themeId,
+    cardId,
+    orientation,
+    forceResolution,
+    size: theme.resolution?.size || '512x1024',
+    frame: path.relative(ROOT, frame)
+  });
+
+  backupExisting(themeId, cardId, orientation);
+  const prompt = assemblePrompt(theme, cardId, orientation, forceResolution);
+  log('generate-card', '已组装提示词', {
+    themeId,
+    cardId,
+    orientation,
+    promptLength: prompt.length,
+    promptPreview: `${prompt.slice(0, 220)}${prompt.length > 220 ? '...' : ''}`
+  });
+
+  const result = await runGPTImageGen({
+    command: 'edit',
+    prompt,
+    image: frame,
+    size: theme.resolution?.size || '512x1024',
+    quality: 'auto',
+    response_format: 'b64_json'
+  }, { themeId, cardId, orientation, mode: 'image-to-image' });
+  const stem = cardFileStem(cardId, orientation);
+  const dest = copyGeneratedToTheme(result, themeId, stem);
+  log('generate-card', '卡牌生成流程完成', {
+    themeId,
+    cardId,
+    orientation,
+    output: path.relative(ROOT, dest)
+  });
+  return { prompt, image: `/api/themes/${encodeURIComponent(themeId)}/cards/${encodeURIComponent(path.basename(dest))}`, raw: result.result?.details };
+}
+
+async function generateFrame(themeId, prompt, size = '512x1024') {
+  const theme = loadTheme(themeId);
+  const fullPrompt = `${prompt}\n\n竖版塔罗牌卡牌框示例图，比例 1:2，分辨率 ${size}。必须包含统一边框、中心插画区、标题/编号装饰区，但不要生成具体塔罗人物。`;
+
+  log('generate-frame', '收到卡牌框生成请求', {
+    themeId,
+    size,
+    promptLength: fullPrompt.length,
+    promptPreview: `${fullPrompt.slice(0, 220)}${fullPrompt.length > 220 ? '...' : ''}`
+  });
+
+  const result = await runGPTImageGen({
+    command: 'generate',
+    prompt: fullPrompt,
+    size,
+    quality: 'auto',
+    response_format: 'b64_json'
+  }, { themeId, mode: 'text-to-image-frame' });
+  const details = result.result?.details || {};
+  const serverPath = Array.isArray(details.serverPath) ? details.serverPath[0] : details.serverPath;
+  const source = path.join(ROOT, serverPath);
+  const dest = path.join(themePath(themeId), theme.assets.frameExample || 'frame-example.png');
+  fs.copyFileSync(source, dest);
+  log('generate-frame', '卡牌框生成流程完成', {
+    themeId,
+    source: path.relative(ROOT, source),
+    output: path.relative(ROOT, dest)
+  });
+  return { prompt: fullPrompt, frameExampleUrl: `/api/themes/${encodeURIComponent(themeId)}/frame` };
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      if (!text) return resolve({});
+      try { resolve(JSON.parse(text)); } catch (error) { reject(error); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function serveStatic(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const pathname = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname);
+  const file = path.resolve(PUBLIC_DIR, `.${pathname}`);
+  if (!file.startsWith(PUBLIC_DIR) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return false;
+  sendText(res, 200, fs.readFileSync(file), mimeOf(file));
+  return true;
+}
+
+function serveThemeFile(res, themeId, area, file = '') {
+  const base = themePath(themeId);
+  let target = '';
+  if (area === 'frame') target = path.join(base, loadTheme(themeId).assets.frameExample || 'frame-example.png');
+  if (area === 'cards') target = path.join(base, 'cards', file);
+  if (area === 'backup') target = path.join(base, 'backup', file);
+  const resolved = path.resolve(target);
+  if (!resolved.startsWith(path.resolve(base)) || !fs.existsSync(resolved)) return send(res, 404, { error: '文件不存在' });
+  sendText(res, 200, fs.readFileSync(resolved), mimeOf(resolved));
+}
+
+async function handleApi(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const parts = url.pathname.split('/').filter(Boolean);
+  const startedAt = Date.now();
+  log('http', '请求开始', { method: req.method, path: url.pathname });
+  try {
+    if (req.method === 'GET' && url.pathname === '/api/cards/default') return send(res, 200, { files: listDefaultCards(), canonical: getCanonicalCards() });
+    if (req.method === 'GET' && url.pathname === '/api/themes') return send(res, 200, { themes: listThemes() });
+    if (req.method === 'POST' && url.pathname === '/api/themes') {
+      const body = await readRequestBody(req);
+      return send(res, 200, createTheme(body.name, body.sourceThemeId || ''));
+    }
+    if (parts[0] === 'api' && parts[1] === 'themes' && parts[2]) {
+      const themeId = decodeURIComponent(parts[2]);
+      if (req.method === 'GET' && parts.length === 3) return send(res, 200, getThemeState(themeId));
+      if (req.method === 'PUT' && parts.length === 3) {
+        saveTheme(themeId, await readRequestBody(req));
+        return send(res, 200, getThemeState(themeId));
+      }
+      if (req.method === 'GET' && ['frame', 'cards', 'backup'].includes(parts[3])) return serveThemeFile(res, themeId, parts[3], decodeURIComponent(parts[4] || ''));
+      if (req.method === 'POST' && parts[3] === 'generate-card') {
+        const body = await readRequestBody(req);
+        const result = await generateCard(themeId, body.cardId, body.orientation || 'upright', Boolean(body.forceResolution));
+        log('http', '请求完成', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
+        return send(res, 200, result);
+      }
+      if (req.method === 'POST' && parts[3] === 'generate-frame') {
+        const body = await readRequestBody(req);
+        const result = await generateFrame(themeId, body.prompt || '', body.size || '512x1024');
+        log('http', '请求完成', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
+        return send(res, 200, result);
+      }
+    }
+    log('http', '请求未匹配', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
+    send(res, 404, { error: 'API 不存在' });
+  } catch (error) {
+    log('http', '请求失败', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt, error: error.message });
+    send(res, 500, { error: error.message });
+  }
+}
+
+ensureDir(THEMES_DIR);
+const server = http.createServer((req, res) => {
+  if (req.url.startsWith('/api/')) return handleApi(req, res);
+  if (serveStatic(req, res)) return;
+  send(res, 404, { error: 'Not Found' });
+});
+
+server.listen(PORT, () => {
+  console.log(`Tarot Card Generator running at http://localhost:${PORT}`);
+});
