@@ -388,6 +388,7 @@ function runImagePlugin(provider, args, context = {}) {
     });
 
     const child = spawn(process.execPath, [path.join(ROOT, provider.script)], { cwd: ROOT, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    if (context.queueJob) context.queueJob.activeChild = child;
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
@@ -436,6 +437,146 @@ function runImagePlugin(provider, args, context = {}) {
   });
 }
 
+const generationJobs = new Map();
+
+function getQueueJob(jobId) {
+  const job = generationJobs.get(jobId);
+  if (!job) throw new Error(`生成队列不存在: ${jobId}`);
+  return job;
+}
+
+function serializeQueueJob(job) {
+  return {
+    id: job.id,
+    themeId: job.themeId,
+    provider: job.provider,
+    status: job.status,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+    cancelRequested: job.cancelRequested,
+    total: job.items.length,
+    completed: job.items.filter((item) => item.status === 'success').length,
+    skipped: job.items.filter((item) => item.status === 'skipped').length,
+    failed: job.items.filter((item) => item.status === 'failed').length,
+    canceled: job.items.filter((item) => item.status === 'canceled').length,
+    current: job.items.find((item) => item.status === 'running')?.label || null,
+    items: job.items.map(({ cardId, orientation, label, status, error, image }) => ({
+      cardId, orientation, label, status, error: error || '', image: image || ''
+    }))
+  };
+}
+
+function findBlankGenerationItems(themeId) {
+  const state = getThemeState(themeId);
+  const items = [];
+  for (const card of state.cards) {
+    for (const orientation of ['upright', 'reversed']) {
+      if (card.id === '牌背' && orientation === 'reversed') continue;
+      if (!card.images?.[orientation]) {
+        items.push({
+          cardId: card.id,
+          orientation,
+          label: `${card.name} / ${orientation === 'reversed' ? '逆位' : '正位'}`,
+          status: 'queued'
+        });
+      }
+    }
+  }
+  return items;
+}
+
+async function processGenerationQueue(job) {
+  job.status = 'running';
+  job.startedAt = new Date().toISOString();
+
+  for (const item of job.items) {
+    if (job.cancelRequested) {
+      item.status = 'canceled';
+      item.error = '已中止';
+      continue;
+    }
+
+    // 队列创建后如果该卡牌已被手动生成或被其他任务生成，则跳过，避免重复覆盖。
+    if (findCardImage(job.themeId, item.cardId, item.orientation)) {
+      item.status = 'skipped';
+      item.error = '已有图片，已跳过';
+      continue;
+    }
+
+    item.status = 'running';
+    try {
+      const result = await generateCard(job.themeId, item.cardId, item.orientation, false, job.provider, job);
+      item.status = 'success';
+      item.image = result.image;
+    } catch (error) {
+      item.status = job.cancelRequested ? 'canceled' : 'failed';
+      item.error = job.cancelRequested ? '已中止' : error.message;
+      if (!job.cancelRequested) log('queue', '队列项目失败', {
+        jobId: job.id, themeId: job.themeId, cardId: item.cardId,
+        orientation: item.orientation, error: error.message
+      });
+    } finally {
+      job.activeChild = null;
+    }
+  }
+
+  if (job.cancelRequested) {
+    for (const item of job.items) {
+      if (item.status === 'queued' || item.status === 'running') {
+        item.status = 'canceled';
+        item.error = '已中止';
+      }
+    }
+    job.status = 'canceled';
+  } else {
+    job.status = job.items.some((item) => item.status === 'failed') ? 'completed_with_errors' : 'completed';
+  }
+  job.finishedAt = new Date().toISOString();
+  job.activeChild = null;
+}
+
+function startGenerationQueue(themeId, providerId = '') {
+  const provider = resolveProvider(providerId);
+  const items = findBlankGenerationItems(themeId);
+  if (!items.length) throw new Error('当前主题没有空白卡牌，无需批量生成');
+
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id,
+    themeId,
+    provider: provider.id,
+    items,
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    cancelRequested: false,
+    activeChild: null
+  };
+  generationJobs.set(id, job);
+  processGenerationQueue(job).catch((error) => {
+    job.status = 'failed';
+    job.finishedAt = new Date().toISOString();
+    log('queue', '队列异常终止', { jobId: id, error: error.message });
+  });
+  return serializeQueueJob(job);
+}
+
+function cancelGenerationQueue(jobId) {
+  const job = getQueueJob(jobId);
+  if (['completed', 'completed_with_errors', 'canceled', 'failed'].includes(job.status)) {
+    return serializeQueueJob(job);
+  }
+  job.cancelRequested = true;
+  if (job.activeChild) {
+    try {
+      job.activeChild.kill();
+    } catch (error) {
+      log('queue', '终止当前生成进程失败', { jobId, error: error.message });
+    }
+  }
+  return serializeQueueJob(job);
+}
+
 function copyGeneratedToTheme(result, themeId, targetName) {
   const details = result.result?.details || {};
   const serverPath = Array.isArray(details.serverPath) ? details.serverPath[0] : details.serverPath;
@@ -455,7 +596,7 @@ function copyGeneratedToTheme(result, themeId, targetName) {
   return dest;
 }
 
-async function generateCard(themeId, cardId, orientation = 'upright', forceResolution = false, providerId = '') {
+async function generateCard(themeId, cardId, orientation = 'upright', forceResolution = false, providerId = '', queueJob = null) {
   const provider = resolveProvider(providerId);
   const theme = loadTheme(themeId);
   const frame = path.join(themePath(themeId), theme.assets.frameExample || 'frame-example.png');
@@ -486,7 +627,7 @@ async function generateCard(themeId, cardId, orientation = 'upright', forceResol
     image: frame,
     size: theme.resolution?.size || '512x1024'
   });
-  const result = await runImagePlugin(provider, pluginArgs, { themeId, cardId, orientation, mode: 'image-to-image' });
+  const result = await runImagePlugin(provider, pluginArgs, { themeId, cardId, orientation, mode: 'image-to-image', queueJob });
   // 先确认生成成功再备份旧图，避免生成失败导致旧卡牌"消失"
   backupExisting(themeId, cardId, orientation);
   const stem = cardFileStem(cardId, orientation);
@@ -589,6 +730,16 @@ async function handleApi(req, res) {
         const result = await generateCard(themeId, body.cardId, body.orientation || 'upright', Boolean(body.forceResolution), body.provider || '');
         log('http', '请求完成', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
         return send(res, 200, result);
+      }
+      if (req.method === 'POST' && parts[3] === 'generate-blank-queue') {
+        const body = await readRequestBody(req);
+        return send(res, 202, startGenerationQueue(themeId, body.provider || ''));
+      }
+      if (req.method === 'GET' && parts[3] === 'generate-blank-queue' && parts[4]) {
+        return send(res, 200, serializeQueueJob(getQueueJob(decodeURIComponent(parts[4]))));
+      }
+      if (req.method === 'POST' && parts[3] === 'cancel-generate-blank-queue' && parts[4]) {
+        return send(res, 200, cancelGenerationQueue(decodeURIComponent(parts[4])));
       }
       if (req.method === 'POST' && parts[3] === 'generate-frame') {
         const body = await readRequestBody(req);

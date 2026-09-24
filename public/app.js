@@ -6,7 +6,9 @@ const state = {
   defaultCards: [],
   providers: [],
   provider: localStorage.getItem(PROVIDER_STORAGE_KEY) || '',
-  busy: false
+  busy: false,
+  queue: null,
+  queueTimer: null
 };
 
 const $ = (id) => document.getElementById(id);
@@ -169,6 +171,103 @@ function renderCards() {
   `).join('');
 }
 
+function queueStatusText(status) {
+  return {
+    queued: '排队中',
+    running: '生成中',
+    success: '已完成',
+    failed: '失败',
+    canceled: '已取消'
+  }[status] || status;
+}
+
+function renderQueue(job) {
+  const summary = $('queueSummary');
+  const list = $('queueList');
+  const cancelButton = $('cancelQueueBtn');
+  const startButton = $('generateBlankQueueBtn');
+
+  if (!job) {
+    summary.textContent = '暂无批量生成任务';
+    list.innerHTML = '';
+    cancelButton.classList.add('hidden');
+    startButton.disabled = false;
+    return;
+  }
+
+  const finished = job.completed + job.failed + job.canceled;
+  const running = ['queued', 'running'].includes(job.status);
+  summary.innerHTML = `
+    <div><strong>${job.status === 'running' ? '正在批量生成' : job.status === 'completed' ? '批量生成完成' : job.status === 'canceled' ? '队列已中止' : job.status === 'completed_with_errors' ? '生成完成，但有失败项目' : '队列已创建'}</strong></div>
+    <div>进度：${finished} / ${job.total}　成功：${job.completed}　失败：${job.failed}　取消：${job.canceled}</div>
+    ${job.current ? `<div>当前：${job.current}</div>` : ''}
+  `;
+  list.innerHTML = job.items.map((item) => `
+    <div class="queue-item queue-${item.status}">
+      <span>${item.label}</span>
+      <span>${queueStatusText(item.status)}${item.error ? `：${item.error.slice(0, 80)}` : ''}</span>
+    </div>
+  `).join('');
+  cancelButton.classList.toggle('hidden', !running);
+  startButton.disabled = running;
+}
+
+function stopQueuePolling() {
+  if (state.queueTimer) {
+    clearTimeout(state.queueTimer);
+    state.queueTimer = null;
+  }
+}
+
+async function pollQueue() {
+  if (!state.queue?.id || !state.current) return;
+  try {
+    const themeId = encodeURIComponent(state.queue.themeId);
+    state.queue = await api(`/api/themes/${themeId}/generate-blank-queue/${encodeURIComponent(state.queue.id)}`);
+    renderQueue(state.queue);
+    if (['completed', 'completed_with_errors', 'canceled', 'failed'].includes(state.queue.status)) {
+      stopQueuePolling();
+      await loadTheme(state.queue.themeId);
+      return;
+    }
+    state.queueTimer = setTimeout(pollQueue, 1000);
+  } catch (error) {
+    stopQueuePolling();
+    renderQueue({ ...state.queue, status: 'failed', current: null, items: state.queue.items || [], failed: 1, error: error.message });
+    alert(`队列状态获取失败：${error.message}`);
+  }
+}
+
+async function startBlankQueue() {
+  if (!state.current || state.queue && ['queued', 'running'].includes(state.queue.status)) return;
+  await saveTheme();
+  setBusy(true);
+  try {
+    state.queue = await api(`/api/themes/${encodeURIComponent(state.current.theme.id)}/generate-blank-queue`, {
+      method: 'POST',
+      body: JSON.stringify({ provider: state.provider })
+    });
+    renderQueue(state.queue);
+    pollQueue();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function cancelBlankQueue() {
+  if (!state.queue?.id) return;
+  try {
+    state.queue = await api(`/api/themes/${encodeURIComponent(state.queue.themeId)}/cancel-generate-blank-queue/${encodeURIComponent(state.queue.id)}`, {
+      method: 'POST'
+    });
+    renderQueue(state.queue);
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
 function renderProviders() {
   const select = $('providerSelect');
   if (state.providers.length) {
@@ -315,7 +414,14 @@ function bindEvents() {
   $('createThemeBtn').addEventListener('click', createTheme);
   $('saveThemeBtn').addEventListener('click', saveTheme);
   $('generateFrameBtn').addEventListener('click', generateFrame);
-  $('themeSelect').addEventListener('change', (event) => loadTheme(event.target.value));
+  $('generateBlankQueueBtn').addEventListener('click', startBlankQueue);
+  $('cancelQueueBtn').addEventListener('click', cancelBlankQueue);
+  $('themeSelect').addEventListener('change', async (event) => {
+    stopQueuePolling();
+    state.queue = null;
+    renderQueue(null);
+    await loadTheme(event.target.value);
+  });
   $('themeResolution').addEventListener('change', () => {
     $('resolutionPrompt').value = resolutionPrompt($('themeResolution').value);
   });
@@ -339,6 +445,7 @@ async function init() {
     await loadThemes();
     if (state.themes.length && !state.current) await loadTheme(state.themes[0].id);
     else renderEditor();
+    renderQueue(state.queue);
   } catch (error) {
     alert(error.message);
   } finally {

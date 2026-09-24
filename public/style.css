@@ -147,6 +147,60 @@ label textarea {
   line-height: 1.7;
 }
 
+.queue-list {
+  max-height: 260px;
+  overflow: auto;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11111b;
+}
+
+.queue-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-bottom: 1px solid rgba(52, 52, 76, .65);
+  font-size: 12px;
+}
+
+.queue-item:last-child {
+  border-bottom: 0;
+}
+
+.queue-item span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item span:last-child {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.queue-running span:last-child {
+  color: var(--accent);
+}
+
+.queue-success span:last-child {
+  color: var(--ok);
+}
+
+.queue-failed span:last-child {
+  color: var(--danger);
+}
+
+.queue-canceled span:last-child {
+  color: var(--muted);
+}
+
+button.danger {
+  border-color: var(--danger);
+  background: linear-gradient(180deg, #a83f61, #752b47);
+}
+
 .editor-header {
   display: flex;
   align-items: center;
