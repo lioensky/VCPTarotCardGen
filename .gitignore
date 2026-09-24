@@ -1,2 +1,8 @@
 config.env
 tarotcardsthemes/
+
+# 生图插件输出的原始资产（GPTImageGen -> image/gptimagegen/，DoubaoGen -> image/doubaogen/）
+image/
+
+# DoubaoGen 运行时缓存（含 API 密钥池状态与明文密钥，切勿提交）
+.doubao_api_cache.json

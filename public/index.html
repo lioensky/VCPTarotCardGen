@@ -17,6 +17,13 @@
 
   <main class="layout">
     <aside class="panel">
+      <h2>生图引擎</h2>
+      <select id="providerSelect" title="卡牌与卡牌框生成所使用的模型通道">
+        <option value="gptimage">GPT Image (gpt-image-2)</option>
+        <option value="doubao">豆包 Seedream (火山方舟)</option>
+      </select>
+      <div id="providerHint" class="summary"></div>
+
       <h2>主题管理</h2>
       <div class="row">
         <input id="newThemeName" placeholder="新主题名称">

@@ -14,6 +14,19 @@ const TEMPLATE_THEME = path.join(ROOT, 'templates', 'default-theme.json');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
+// 生图引擎注册表
+const PROVIDERS = {
+  gptimage: { id: 'gptimage', name: 'GPT Image (gpt-image-2)', script: 'GPTImageGen.js', scope: 'gptimage' },
+  doubao: { id: 'doubao', name: '豆包 Seedream (火山方舟)', script: 'DoubaoGen.js', scope: 'doubao' }
+};
+
+// Seedream 对最小像素数有要求，512x1024 等小尺寸会被拒绝，这里映射为同为 1:2 的合规尺寸
+// 可在 config.env 中通过 DOUBAO_SIZE_1K / DOUBAO_SIZE_2K 覆盖（支持 1K/2K/4K 或 WxH）
+const DOUBAO_SIZE_MAP = {
+  '512x1024': '1440x2880',
+  '1024x2048': '2048x4096'
+};
+
 function log(scope, message, meta = {}) {
   const time = new Date().toISOString();
   const metaText = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
@@ -271,40 +284,120 @@ function backupExisting(themeId, cardId, orientation) {
   return dest;
 }
 
-function runGPTImageGen(args, context = {}) {
+function isConfiguredValue(value) {
+  const text = String(value || '').trim();
+  return Boolean(text) && !/your[_-]?api[_-]?key|sk-your-api-key-here/i.test(text);
+}
+
+function getDefaultProviderId() {
+  const env = { ...process.env, ...loadEnvFile() };
+  const id = String(env.IMAGE_PROVIDER || 'gptimage').trim().toLowerCase();
+  return PROVIDERS[id] ? id : 'gptimage';
+}
+
+function listProviders() {
+  const env = { ...process.env, ...loadEnvFile() };
+  return {
+    defaultProvider: getDefaultProviderId(),
+    providers: [
+      { id: 'gptimage', name: PROVIDERS.gptimage.name, configured: isConfiguredValue(env.OPENAI_API_KEY) },
+      { id: 'doubao', name: PROVIDERS.doubao.name, configured: isConfiguredValue(env.VOLCENGINE_API_KEY) }
+    ]
+  };
+}
+
+function resolveProvider(value) {
+  const id = String(value || getDefaultProviderId()).trim().toLowerCase();
+  if (!PROVIDERS[id]) throw new Error(`未知的生图引擎: ${id}`);
+  return PROVIDERS[id];
+}
+
+function doubaoSize(size) {
+  const env = { ...process.env, ...loadEnvFile() };
+  const key = size === '1024x2048' ? 'DOUBAO_SIZE_2K' : 'DOUBAO_SIZE_1K';
+  return env[key] || DOUBAO_SIZE_MAP[size] || size;
+}
+
+function fileToDataUri(file) {
+  const buffer = fs.readFileSync(file);
+  return `data:${mimeOf(file)};base64,${buffer.toString('base64')}`;
+}
+
+/**
+ * 按引擎构建子进程入参
+ * - GPTImageGen：本地路径直接传，size/quality/response_format
+ * - DoubaoGen：只认 data:/http(s)/file:// 图片，统一转 data URI；尺寸用 resolution 并做合规映射
+ */
+function buildPluginArgs(provider, { command, prompt, image, size }) {
+  if (provider.id === 'doubao') {
+    const args = {
+      command,
+      prompt,
+      resolution: doubaoSize(size),
+      output_format: 'png',
+      watermark: false,
+      showbase64: false
+    };
+    if (image) args.image = fileToDataUri(image);
+    return args;
+  }
+  const args = { command, prompt, size, quality: 'auto', response_format: 'b64_json' };
+  if (image) args.image = image;
+  return args;
+}
+
+function describeProvider(provider, env) {
+  if (provider.id === 'doubao') {
+    return {
+      model: env.SEEDREAM_MODEL_ID || '(DoubaoGen 默认)',
+      apiUrl: env.VOLCENGINE_API_URL || '(默认方舟端点)',
+      apiKey: maskSecret(String(env.VOLCENGINE_API_KEY || '').split(',')[0].trim())
+    };
+  }
+  return {
+    model: env.GPT_IMAGE_MODEL || 'gpt-image-2',
+    baseUrl: env.OPENAI_BASE_URL || '',
+    apiKey: maskSecret(env.OPENAI_API_KEY)
+  };
+}
+
+function runImagePlugin(provider, args, context = {}) {
   return new Promise((resolve, reject) => {
     const envFile = loadEnvFile();
     const env = { ...process.env, ...envFile, PROJECT_BASE_PATH: ROOT };
     const startedAt = Date.now();
+    const scope = provider.scope;
+    const imageDesc = !args.image
+      ? ''
+      : (String(args.image).startsWith('data:') ? `data-uri(${args.image.length} chars)` : path.relative(ROOT, args.image));
     const safeArgs = {
       command: args.command,
-      size: args.size,
+      size: args.size || args.resolution,
       quality: args.quality,
       response_format: args.response_format,
-      image: args.image ? path.relative(ROOT, args.image) : '',
+      image: imageDesc,
       promptLength: args.prompt?.length || 0,
       promptPreview: args.prompt ? `${args.prompt.slice(0, 160)}${args.prompt.length > 160 ? '...' : ''}` : ''
     };
 
-    log('gptimage', '开始调用 GPTImageGen', {
+    log(scope, `开始调用 ${provider.script}`, {
       ...context,
-      model: env.GPT_IMAGE_MODEL || 'gpt-image-2',
-      baseUrl: env.OPENAI_BASE_URL || '',
-      apiKey: maskSecret(env.OPENAI_API_KEY),
+      provider: provider.id,
+      ...describeProvider(provider, env),
       args: safeArgs
     });
 
-    const child = spawn(process.execPath, [path.join(ROOT, 'GPTImageGen.js')], { cwd: ROOT, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [path.join(ROOT, provider.script)], { cwd: ROOT, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString();
       stderr += text;
-      text.split(/\r?\n/).filter(Boolean).forEach((line) => log('gptimage:stderr', line));
+      text.split(/\r?\n/).filter(Boolean).forEach((line) => log(`${scope}:stderr`, line));
     });
     child.on('error', (error) => {
-      log('gptimage', '子进程启动失败', { ...context, error: error.message });
+      log(scope, '子进程启动失败', { ...context, error: error.message });
       reject(error);
     });
     child.on('close', (code) => {
@@ -312,12 +405,12 @@ function runGPTImageGen(args, context = {}) {
       try {
         const parsed = JSON.parse(stdout.trim());
         if (parsed.status !== 'success') {
-          const errorMessage = parsed.error || stderr || 'GPTImageGen 调用失败';
-          log('gptimage', '调用失败', { ...context, code, durationMs, error: errorMessage });
+          const errorMessage = parsed.error || stderr || `${provider.script} 调用失败`;
+          log(scope, '调用失败', { ...context, code, durationMs, error: errorMessage });
           reject(new Error(errorMessage));
         } else {
           const details = parsed.result?.details || {};
-          log('gptimage', '调用成功', {
+          log(scope, '调用成功', {
             ...context,
             code,
             durationMs,
@@ -328,7 +421,7 @@ function runGPTImageGen(args, context = {}) {
           resolve(parsed);
         }
       } catch (error) {
-        log('gptimage', '输出解析失败', {
+        log(scope, '输出解析失败', {
           ...context,
           code,
           durationMs,
@@ -336,7 +429,7 @@ function runGPTImageGen(args, context = {}) {
           stdoutPreview: stdout.slice(0, 300),
           stderrPreview: stderr.slice(0, 300)
         });
-        reject(new Error(`GPTImageGen 输出解析失败: ${error.message}\n${stdout}\n${stderr}`));
+        reject(new Error(`${provider.script} 输出解析失败: ${error.message}\n${stdout.slice(0, 1000)}\n${stderr.slice(0, 1000)}`));
       }
     });
     child.stdin.end(JSON.stringify(args));
@@ -362,7 +455,8 @@ function copyGeneratedToTheme(result, themeId, targetName) {
   return dest;
 }
 
-async function generateCard(themeId, cardId, orientation = 'upright', forceResolution = false) {
+async function generateCard(themeId, cardId, orientation = 'upright', forceResolution = false, providerId = '') {
+  const provider = resolveProvider(providerId);
   const theme = loadTheme(themeId);
   const frame = path.join(themePath(themeId), theme.assets.frameExample || 'frame-example.png');
   if (!fs.existsSync(frame)) throw new Error('缺少卡牌框示例图，请先上传或生成 frame-example.png');
@@ -372,11 +466,11 @@ async function generateCard(themeId, cardId, orientation = 'upright', forceResol
     cardId,
     orientation,
     forceResolution,
+    provider: provider.id,
     size: theme.resolution?.size || '512x1024',
     frame: path.relative(ROOT, frame)
   });
 
-  backupExisting(themeId, cardId, orientation);
   const prompt = assemblePrompt(theme, cardId, orientation, forceResolution);
   log('generate-card', '已组装提示词', {
     themeId,
@@ -386,45 +480,45 @@ async function generateCard(themeId, cardId, orientation = 'upright', forceResol
     promptPreview: `${prompt.slice(0, 220)}${prompt.length > 220 ? '...' : ''}`
   });
 
-  const result = await runGPTImageGen({
+  const pluginArgs = buildPluginArgs(provider, {
     command: 'edit',
     prompt,
     image: frame,
-    size: theme.resolution?.size || '512x1024',
-    quality: 'auto',
-    response_format: 'b64_json'
-  }, { themeId, cardId, orientation, mode: 'image-to-image' });
+    size: theme.resolution?.size || '512x1024'
+  });
+  const result = await runImagePlugin(provider, pluginArgs, { themeId, cardId, orientation, mode: 'image-to-image' });
+  // 先确认生成成功再备份旧图，避免生成失败导致旧卡牌"消失"
+  backupExisting(themeId, cardId, orientation);
   const stem = cardFileStem(cardId, orientation);
   const dest = copyGeneratedToTheme(result, themeId, stem);
   log('generate-card', '卡牌生成流程完成', {
     themeId,
     cardId,
     orientation,
+    provider: provider.id,
     output: path.relative(ROOT, dest)
   });
-  return { prompt, image: `/api/themes/${encodeURIComponent(themeId)}/cards/${encodeURIComponent(path.basename(dest))}`, raw: result.result?.details };
+  return { prompt, provider: provider.id, image: `/api/themes/${encodeURIComponent(themeId)}/cards/${encodeURIComponent(path.basename(dest))}`, raw: result.result?.details };
 }
 
-async function generateFrame(themeId, prompt, size = '512x1024') {
+async function generateFrame(themeId, prompt, size = '512x1024', providerId = '') {
+  const provider = resolveProvider(providerId);
   const theme = loadTheme(themeId);
   const fullPrompt = `${prompt}\n\n竖版塔罗牌卡牌框示例图，比例 1:2，分辨率 ${size}。必须包含统一边框、中心插画区、标题/编号装饰区，但不要生成具体塔罗人物。`;
 
   log('generate-frame', '收到卡牌框生成请求', {
     themeId,
     size,
+    provider: provider.id,
     promptLength: fullPrompt.length,
     promptPreview: `${fullPrompt.slice(0, 220)}${fullPrompt.length > 220 ? '...' : ''}`
   });
 
-  const result = await runGPTImageGen({
-    command: 'generate',
-    prompt: fullPrompt,
-    size,
-    quality: 'auto',
-    response_format: 'b64_json'
-  }, { themeId, mode: 'text-to-image-frame' });
+  const pluginArgs = buildPluginArgs(provider, { command: 'generate', prompt: fullPrompt, size });
+  const result = await runImagePlugin(provider, pluginArgs, { themeId, mode: 'text-to-image-frame' });
   const details = result.result?.details || {};
   const serverPath = Array.isArray(details.serverPath) ? details.serverPath[0] : details.serverPath;
+  if (!serverPath) throw new Error('生成结果缺少 serverPath');
   const source = path.join(ROOT, serverPath);
   const dest = path.join(themePath(themeId), theme.assets.frameExample || 'frame-example.png');
   fs.copyFileSync(source, dest);
@@ -475,6 +569,7 @@ async function handleApi(req, res) {
   const startedAt = Date.now();
   log('http', '请求开始', { method: req.method, path: url.pathname });
   try {
+    if (req.method === 'GET' && url.pathname === '/api/providers') return send(res, 200, listProviders());
     if (req.method === 'GET' && url.pathname === '/api/cards/default') return send(res, 200, { files: listDefaultCards(), canonical: getCanonicalCards() });
     if (req.method === 'GET' && url.pathname === '/api/themes') return send(res, 200, { themes: listThemes() });
     if (req.method === 'POST' && url.pathname === '/api/themes') {
@@ -491,13 +586,13 @@ async function handleApi(req, res) {
       if (req.method === 'GET' && ['frame', 'cards', 'backup'].includes(parts[3])) return serveThemeFile(res, themeId, parts[3], decodeURIComponent(parts[4] || ''));
       if (req.method === 'POST' && parts[3] === 'generate-card') {
         const body = await readRequestBody(req);
-        const result = await generateCard(themeId, body.cardId, body.orientation || 'upright', Boolean(body.forceResolution));
+        const result = await generateCard(themeId, body.cardId, body.orientation || 'upright', Boolean(body.forceResolution), body.provider || '');
         log('http', '请求完成', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
         return send(res, 200, result);
       }
       if (req.method === 'POST' && parts[3] === 'generate-frame') {
         const body = await readRequestBody(req);
-        const result = await generateFrame(themeId, body.prompt || '', body.size || '512x1024');
+        const result = await generateFrame(themeId, body.prompt || '', body.size || '512x1024', body.provider || '');
         log('http', '请求完成', { method: req.method, path: url.pathname, durationMs: Date.now() - startedAt });
         return send(res, 200, result);
       }

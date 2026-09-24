@@ -1,7 +1,11 @@
+const PROVIDER_STORAGE_KEY = 'tarot.imageProvider';
+
 const state = {
   themes: [],
   current: null,
   defaultCards: [],
+  providers: [],
+  provider: localStorage.getItem(PROVIDER_STORAGE_KEY) || '',
   busy: false
 };
 
@@ -165,6 +169,45 @@ function renderCards() {
   `).join('');
 }
 
+function renderProviders() {
+  const select = $('providerSelect');
+  if (state.providers.length) {
+    select.innerHTML = '';
+    state.providers.forEach((item) => {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = item.configured ? item.name : `${item.name}（未配置密钥）`;
+      select.appendChild(option);
+    });
+  }
+  select.value = state.provider;
+  renderProviderHint();
+}
+
+function renderProviderHint() {
+  const current = state.providers.find((item) => item.id === state.provider);
+  const hint = $('providerHint');
+  if (!current) { hint.textContent = ''; return; }
+  const tips = {
+    gptimage: '使用 GPTImageGen.js，读取 OPENAI_API_KEY / OPENAI_BASE_URL。',
+    doubao: '使用 DoubaoGen.js，读取 VOLCENGINE_API_KEY / VOLCENGINE_API_URL。Seedream 最小像素有限制，1k/2k 会自动映射为 1440x2880 / 2048x4096（可用 DOUBAO_SIZE_1K / DOUBAO_SIZE_2K 覆盖）。'
+  };
+  hint.innerHTML = `<div>${tips[current.id] || ''}</div>${current.configured ? '' : '<div style="color:#c0392b">⚠ config.env 中未配置该引擎的 API 密钥</div>'}`;
+}
+
+async function loadProviders() {
+  try {
+    const data = await api('/api/providers');
+    state.providers = data.providers || [];
+    const ids = state.providers.map((item) => item.id);
+    if (!ids.includes(state.provider)) state.provider = data.defaultProvider || ids[0] || 'gptimage';
+  } catch (error) {
+    console.warn('加载生图引擎列表失败', error);
+    state.provider ||= 'gptimage';
+  }
+  renderProviders();
+}
+
 async function loadThemes() {
   const data = await api('/api/themes');
   state.themes = data.themes;
@@ -228,7 +271,7 @@ async function generateFrame() {
   try {
     await api(`/api/themes/${encodeURIComponent(state.current.theme.id)}/generate-frame`, {
       method: 'POST',
-      body: JSON.stringify({ prompt, size: $('frameSize').value })
+      body: JSON.stringify({ prompt, size: $('frameSize').value, provider: state.provider })
     });
     await loadTheme(state.current.theme.id);
   } catch (error) {
@@ -245,7 +288,7 @@ async function generateCard(cardId, orientation) {
   try {
     await api(`/api/themes/${encodeURIComponent(state.current.theme.id)}/generate-card`, {
       method: 'POST',
-      body: JSON.stringify({ cardId, orientation, forceResolution: !state.current.frameExampleExists })
+      body: JSON.stringify({ cardId, orientation, forceResolution: !state.current.frameExampleExists, provider: state.provider })
     });
     await loadTheme(state.current.theme.id);
   } catch (error) {
@@ -264,6 +307,11 @@ function showPrompt(cardId, orientation) {
 
 function bindEvents() {
   $('refreshBtn').addEventListener('click', init);
+  $('providerSelect').addEventListener('change', (event) => {
+    state.provider = event.target.value;
+    localStorage.setItem(PROVIDER_STORAGE_KEY, state.provider);
+    renderProviderHint();
+  });
   $('createThemeBtn').addEventListener('click', createTheme);
   $('saveThemeBtn').addEventListener('click', saveTheme);
   $('generateFrameBtn').addEventListener('click', generateFrame);
@@ -286,6 +334,7 @@ function bindEvents() {
 async function init() {
   setBusy(true);
   try {
+    await loadProviders();
     await loadDefaultCards();
     await loadThemes();
     if (state.themes.length && !state.current) await loadTheme(state.themes[0].id);
